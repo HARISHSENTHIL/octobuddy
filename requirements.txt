@@ -1,0 +1,8 @@
+sounddevice
+numpy
+openwakeword
+requests
+PyYAML
+soundfile
+piper
+librosa

@@ -1,0 +1,18 @@
+wakeword:
+  model_path: "/Users/arunmozhi/openwakeword_models/hey_rona.onnx"  # <-- absolute path
+  backend: "onnx"   # mac: onnx ; pi: tflite (later)
+whisper:
+  bin: "./whisper.cpp/main"
+  model: "./whisper.cpp/models/ggml-base.en.bin"
+piper:
+  model: "./piper_voices/en_US-lessac-medium.onnx"
+  config: "./piper_voices/en_US-lessac-medium.onnx.json"
+cloud:
+  mode: "llama"         # "llama" | "openai" | "off"
+  llama_url: "http://127.0.0.1:8080/completion"
+  # if using OpenAI or similar, set OPENAI_API_KEY in env and change 'mode'
+cache:
+  file: "cache.json"
+  max_items: 200
+safety:
+  blocked_terms: ["kill", "violence", "gun", "suicide", "sex"]
