@@ -1,42 +1,36 @@
 #!/usr/bin/env python3
 """
-Silent Wake Word Detection
-Only activates and prints when wake word is actually detected
-No continuous loop output - truly silent operation
+Ubuntu-Optimized Wake Word Detection
+Uses openWakeWord's built-in Speex noise suppression for optimal performance
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-from collections import deque
+from typing import Optional, Tuple, Dict
 import time
 import numpy as np
 import sounddevice as sd
-import onnxruntime as ort
-import librosa
+import openwakeword
+from openwakeword.model import Model
 
 def _rms(x: np.ndarray) -> float:
+    """Calculate RMS energy of audio"""
     if x.size == 0:
         return 0.0
     x = x.astype(np.float64, copy=False)
     return float(np.sqrt(np.mean(np.square(x))))
 
 def create_progress_bar(score: float, threshold: float, complete: bool = False) -> str:
-    """Create a visual progress bar for wake word detection"""
+    """Create visual progress bar for wake word detection"""
     if complete:
         return "█████████████████████ ✅"
     
-    # Calculate progress (0 to 1)
-    max_display = threshold * 3  # Show progress up to 3x threshold
+    max_display = threshold * 3
     progress = min(score / max_display, 1.0)
-    
-    # Create bar
     filled = int(progress * 20)
     empty = 20 - filled
-    
     bar = "█" * filled + "░" * empty
     
-    # Add indicator when approaching threshold
     if score >= threshold * 0.8:
         indicator = " 🔥"
     elif score >= threshold * 0.5:
@@ -46,139 +40,96 @@ def create_progress_bar(score: float, threshold: float, complete: bool = False) 
     
     return bar + indicator
 
-def _calibrate_noise(
-    seconds: float = 1.0,
-    samplerate: int = 16000,
-    input_device_index: Optional[int] = None,
-    blocksize: int = 1024,
-) -> float:
-    """Silent microphone calibration"""
-    kwargs = {
-        "channels": 1,
-        "samplerate": samplerate,
-        "blocksize": blocksize,
-        "dtype": "float32",
-    }
-    if input_device_index is not None:
-        kwargs["device"] = input_device_index
-
-    acc: List[float] = []
-    with sd.InputStream(**kwargs) as stream:
-        t_end = time.time() + seconds
-        while time.time() < t_end:
-            audio, _ = stream.read(blocksize)
-            acc.append(_rms(np.squeeze(audio)))
-    return float(np.median(acc)) if acc else 0.0
-
-class SilentWakeDetector:
+class UbuntuWakeDetector:
     """
-    Truly silent wake word detector - no continuous output
-    Only prints when wake word is detected or on startup
+    Ubuntu-optimized wake word detector using openWakeWord
+    Leverages built-in Speex noise suppression for better performance
     """
-    def __init__(self, onnx_path: str):
-        onnx_path = str(Path(onnx_path))
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            providers=[
-                ("CoreMLExecutionProvider", {"MLComputeUnits":"ALL","ModelFormat":"MLProgram"}), 
-                "CPUExecutionProvider"
-            ]
-        )
-        inp = self.sess.get_inputs()[0]
-        if not (isinstance(inp.shape, list) and len(inp.shape) == 3 and inp.shape[2] == 96):
-            raise ValueError(f"Model must take [1,N,96] format, got {inp.shape}")
+    def __init__(self, model_path: str, enable_speex: bool = True):
+        self.model_path = str(Path(model_path))
+        self.enable_speex = enable_speex
         
-        self.inp_name = inp.name
-        self.n_mels = inp.shape[1]
+        # Initialize openWakeWord model with Speex noise suppression
+        try:
+            # Try new API first (openWakeWord 0.4.0+)
+            self.model = Model(
+                wakeword_models=[self.model_path],
+                enable_speex_noise_suppression=enable_speex,
+                vad_threshold=0.5  # Voice Activity Detection threshold
+            )
+            print(f"[wakeword] ✅ openWakeWord model loaded with Speex: {enable_speex}")
+        except TypeError as e:
+            # Fallback to older API
+            try:
+                self.model = Model(
+                    [self.model_path],
+                    enable_speex_noise_suppression=enable_speex
+                )
+                print(f"[wakeword] ✅ openWakeWord model loaded (legacy API) with Speex: {enable_speex}")
+            except Exception as e2:
+                print(f"[wakeword] ❌ Failed to load openWakeWord model with both APIs: {e2}")
+                raise
+        except Exception as e:
+            print(f"[wakeword] ❌ Failed to load openWakeWord model: {e}")
+            raise
 
-    def _logmel(self, wav_16k: np.ndarray, sr: int = 16000) -> np.ndarray:
-        """Create log mel spectrogram"""
-        S = librosa.feature.melspectrogram(
-            y=wav_16k.astype(np.float32), sr=sr,
-            n_fft=512, hop_length=160, win_length=400,
-            n_mels=self.n_mels, fmin=20, fmax=8000, power=2.0
-        )
-        return np.log10(np.maximum(S, 1e-10))
+    def predict(self, audio_1s: np.ndarray) -> Dict[str, float]:
+        """Predict wake word score using openWakeWord"""
+        try:
+            # Ensure audio is 16-bit 16kHz PCM
+            if audio_1s.dtype != np.int16:
+                audio_1s = (audio_1s * 32767).astype(np.int16)
+            
+            # Get prediction from openWakeWord
+            result = self.model.predict(audio_1s)
+            
+            # Extract score for our model
+            model_name = Path(self.model_path).stem
+            score = result.get(model_name, 0.0)
+            
+            return {model_name: float(score)}
+        except Exception as e:
+            print(f"[wakeword] Prediction error: {e}")
+            return {"hey_octobuddy": 0.0}
 
-    def predict(self, audio_1s: np.ndarray) -> dict:
-        """Predict wake word score silently"""
-        M = self._logmel(audio_1s, 16000)
-        T = M.shape[1]
-        if T < 96:
-            pad = np.zeros((self.n_mels, 96 - T), dtype=M.dtype)
-            M = np.concatenate([M, pad], axis=1)
-        else:
-            M = M[:, -96:]
-        X = M[np.newaxis, :, :].astype(np.float32)
-        out = self.sess.run(None, {self.inp_name: X})
-
-        # Extract score
-        score = None
-        for o in out:
-            if o.ndim == 2 and o.shape[-1] == 1:
-                score = float(o[0, 0]); break
-            if o.ndim == 2 and o.shape[-1] == 2:
-                score = float(o[0, 1]); break
-            if o.size > 0:
-                score = float(o.flat[-1]); break
-        if score is None:
-            score = 0.0
-        return {"hey_octobuddy": score}
-
-def wait_for_wake_silent(
-    model: SilentWakeDetector,
+def wait_for_wake_ubuntu(
+    model: UbuntuWakeDetector,
     threshold: float = 0.005,
     samplerate: int = 16000,
     input_device_index: Optional[int] = None,
     timeout_sec: Optional[float] = None,
-    print_startup: bool = True,
-    **kwargs  # Accept additional arguments for compatibility
+    print_startup: bool = True
 ) -> Tuple[str, float]:
     """
-    Silent wake word detection - only prints on detection or startup
-    No continuous loop output - efficient and quiet operation
+    Ubuntu-optimized wake word detection using openWakeWord
+    Leverages built-in Speex noise suppression and VAD
     """
     
-    # Setup audio streaming
-    chunk_ms = 750  # Longer chunks for efficiency (750ms)
+    # Audio streaming setup
+    chunk_ms = 1000  # 1-second chunks for openWakeWord compatibility
     blocksize = int(samplerate * (chunk_ms / 1000.0))
-    blocksize = max(blocksize, 512)
-    win_samples = int(samplerate * 1.0)  # 1 second window
-    ring = np.zeros(win_samples, dtype=np.float32)
-
+    blocksize = max(blocksize, 1024)
+    
+    # Audio stream configuration
     kwargs = {
         "channels": 1,
         "samplerate": samplerate,
         "blocksize": blocksize,
-        "dtype": "float32",
+        "dtype": "int16",  # openWakeWord expects int16
     }
     if input_device_index is not None:
         kwargs["device"] = input_device_index
 
-    # Silent calibration
     if print_startup:
-        print("[wakeword] 🔧 Initializing wake word detection...")
-    
-    baseline = _calibrate_noise(
-        seconds=0.5,  # Quick calibration
-        samplerate=samplerate,
-        input_device_index=input_device_index,
-        blocksize=1024,
-    )
-    energy_gate = baseline * 1.8  # Higher gate for efficiency
-    
-    if print_startup:
-        print(f"[wakeword] 👂 Listening for 'Hey Octobuddy' (threshold: {threshold})")
-        print(f"[wakeword] 📊 Progress bar will show detection strength")
-        print(f"[wakeword] 🔇 Running silently until wake word detected...")
+        print("[wakeword] 🔧 Initializing Ubuntu-optimized wake word detection...")
+        print(f"[wakeword] 🎯 Using openWakeWord with Speex noise suppression")
+        print(f"[wakeword] 👂 Listening for wake word (threshold: {threshold})")
+        print(f"[wakeword] 🔇 Running silently until detection...")
 
     start_t = time.time()
     last_fire = 0.0
-
-    # Scoring and detection
-    score_buffer = deque(maxlen=2)  # Smaller buffer for faster response
     consecutive_detections = 0
-    required_consecutive = 1  # Only need 1 detection for responsiveness
+    required_consecutive = 1
 
     with sd.InputStream(**kwargs) as stream:
         while True:
@@ -187,58 +138,44 @@ def wait_for_wake_silent(
 
             # Read audio chunk
             audio, _ = stream.read(blocksize)
-            audio = np.squeeze(audio).astype(np.float32, copy=False)
+            audio = np.squeeze(audio).astype(np.int16, copy=False)
 
-            # Update ring buffer
-            n = audio.size
-            if n >= win_samples:
-                ring[:] = audio[-win_samples:]
-            else:
-                ring = np.roll(ring, -n)
-                ring[-n:] = audio
-
-            # Energy gate - skip if too quiet (silent operation)
-            e = _rms(audio)
-            current_time = time.time()
-            
-            if e < energy_gate:
-                consecutive_detections = 0
-                time.sleep(0.2)  # Longer sleep when quiet for efficiency
+            # Skip if audio is too quiet (efficiency)
+            if _rms(audio.astype(np.float32)) < 0.001:
+                time.sleep(0.1)
                 continue
 
             # Predict wake word score
-            preds: Dict[str, float] = model.predict(ring)
-            score = float(preds.get("hey_octobuddy", 0.0))
-            score_buffer.append(score)
-            smoothed = float(np.mean(score_buffer)) if len(score_buffer) > 0 else score
+            preds = model.predict(audio)
+            model_name = list(preds.keys())[0]
+            score = preds[model_name]
 
-            # Detection logic with visual progress bar
-            if smoothed >= threshold and (current_time - last_fire) >= 1.0:  # 1 second cooldown
+            # Detection logic with visual progress
+            current_time = time.time()
+            if score >= threshold and (current_time - last_fire) >= 1.0:
                 consecutive_detections += 1
                 
-                # Show progress bar during detection
                 if consecutive_detections == 1:
-                    progress_bar = create_progress_bar(smoothed, threshold)
-                    print(f"[wakeword] 🔥 Detecting... {progress_bar} {smoothed:.3f}")
+                    progress_bar = create_progress_bar(score, threshold)
+                    print(f"[wakeword] 🔥 Detecting... {progress_bar} {score:.3f}")
                 
                 if consecutive_detections >= required_consecutive:
-                    final_bar = create_progress_bar(smoothed, threshold, complete=True)
-                    print(f"[wakeword] ✅ CONFIRMED! {final_bar} {smoothed:.3f}")
+                    final_bar = create_progress_bar(score, threshold, complete=True)
+                    print(f"[wakeword] ✅ CONFIRMED! {final_bar} {score:.3f}")
                     last_fire = current_time
-                    return "hey_octobuddy", smoothed
+                    return model_name, score
                     
-                time.sleep(0.05)  # Brief pause during detection
+                time.sleep(0.05)
             else:
                 consecutive_detections = 0
                 
-                # Show occasional progress when speaking but not detecting
-                if e > energy_gate and smoothed > 0.002:
-                    progress_bar = create_progress_bar(smoothed, threshold)
-                    print(f"[wakeword] 👂 Listening... {progress_bar} {smoothed:.3f}", end='\r')
+                # Show progress when speaking but not detecting
+                if score > 0.001:
+                    progress_bar = create_progress_bar(score, threshold)
+                    print(f"[wakeword] 👂 Listening... {progress_bar} {score:.3f}", end='\r')
 
-            # Efficient sleep to prevent tight loop
             time.sleep(0.05)
 
-# Alias to maintain compatibility
-DirectWakeONNX = SilentWakeDetector
-wait_for_wake = wait_for_wake_silent
+# Aliases for compatibility
+DirectWakeONNX = UbuntuWakeDetector
+wait_for_wake = wait_for_wake_ubuntu

@@ -16,17 +16,48 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-# ---------- EDIT THESE PATHS ----------
-WAKEWORD_ONNX      = "../models/Hey_octobuddy.onnx"
-INPUT_DEVICE_INDEX = 0  # set after you see [devices] printed on startup
+# ---------- CONFIGURATION ----------
+import yaml
+from pathlib import Path
 
-WHISPER_BIN   = "/Users/harish/Documents/WORK/whisper.cpp/build/bin/whisper-cli"
-WHISPER_MODEL = "/Users/harish/Documents/WORK/whisper.cpp/models/ggml-base.en.bin"
+# Load configuration
+config_path = Path("docs/config.yaml")
+if config_path.exists():
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    WAKEWORD_ONNX = config['wakeword']['model_path']
+    ENABLE_SPEEX = config['wakeword'].get('enable_speex_noise_suppression', True)
+    WAKE_THRESHOLD = config['wakeword'].get('threshold', 0.005)
+    
+    WHISPER_BIN = config['whisper']['bin']
+    WHISPER_MODEL = config['whisper']['model']
+    
+    PIPER_MODEL = config['piper']['model']
+    PIPER_CFG = config['piper']['config']
+    
+    LLAMA_URL = config['cloud']['llama_url']
+    LLAMA_MODEL = config['cloud'].get('model', 'llama3.2:3b')
+else:
+    # Fallback configuration
+    WAKEWORD_ONNX = "models/Hey_octobuddy.onnx"
+    ENABLE_SPEEX = True
+    WAKE_THRESHOLD = 0.005
+    
+    WHISPER_BIN = "/home/hp/Desktop/whisper.cpp/build/bin/whisper-cli"
+    WHISPER_MODEL = "/home/hp/Desktop/whisper.cpp/models/ggml-base.en.bin"
+    
+    PIPER_MODEL = "./models/en_US-lessac-medium.onnx"
+    PIPER_CFG = "./models/en_US-lessac-medium.onnx.json"
+    
+    LLAMA_URL = "http://127.0.0.1:11434/api/generate"
+    LLAMA_MODEL = "llama3.2:3b"
 
-PIPER_MODEL = "../models/en_US-lessac-medium.onnx"
-PIPER_CFG   = "../models/en_US-lessac-medium.onnx.json"
-
-LLAMA_URL = "http://127.0.0.1:8080/completion"
+# Set input device index from config
+try:
+    INPUT_DEVICE_INDEX = config.get('audio', {}).get('input_device_index', 5)  # Default to device 5 (16kHz support)
+except:
+    INPUT_DEVICE_INDEX = 5  # Fallback to device 5 (16kHz support)
 
 # ---- Behavior toggles ----
 INACTIVITY_TIMEOUT_SEC = 60
@@ -35,15 +66,10 @@ MUTE_AFTER_TTS_SEC     = 2.0
 COMMAND_TIMEOUT_SEC    = 10.0     # Time to wait for command after wake word
 MAX_FOLLOW_UP_TURNS    = 3        # Max follow-up questions before returning to wake
 
-# VAD recorder (loosened to catch real speech)
+# Audio settings (Ubuntu-optimized)
 SR                = 16000         # Whisper-friendly
 BLOCK             = 512           # ~32 ms at 16k
-BASELINE_SEC      = 0.25
-START_GATE_MUL    = 1.15           # start when RMS >= baseline * this
-START_MIN_MS      = 180           # must exceed gate this long to start
-SILENCE_GATE_MUL  = 1.10           # below this = silence
-END_SIL_MS        = 900           # stop after trailing silence
-MAX_RECORD_SEC    = 12.0            # hard cap per turn
+MAX_RECORD_SEC    = 12.0          # hard cap per turn
 
 CACHE_PATH = Path("cache.json")
 BLOCKED_TERMS = {"kill","violence","gun","suicide","sex","nsfw","die","hurt","blood","weapon","drugs","nude","porn","bomb"}
@@ -74,7 +100,12 @@ def list_input_devices():
     for i, d in enumerate(devs):
         if d.get("max_input_channels", 0) > 0:
             sr = d.get("default_samplerate", 0)
-            print(f"  #{i:2d}  {d['name']}  (in={d['max_input_channels']}, sr={int(sr)})")
+            # Highlight device that supports 16kHz (Whisper requirement)
+            if sr == 16000:
+                print(f"  #{i:2d}  {d['name']}  (in={d['max_input_channels']}, sr={int(sr)}) ✅ 16kHz - RECOMMENDED")
+            else:
+                print(f"  #{i:2d}  {d['name']}  (in={d['max_input_channels']}, sr={int(sr)})")
+    print(f"[devices] Using device #{INPUT_DEVICE_INDEX} (configured in config.yaml)")
     print("[devices] Default (in,out):", sd.default.device)
 
 # ----------------- Memory -----------------
@@ -137,7 +168,22 @@ def speak_piper(text: str) -> None:
     ]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
     p.communicate(say)
-    subprocess.run(["afplay", str(outwav)], check=False)
+    
+    # Ubuntu-compatible audio playback
+    try:
+        # Try aplay (ALSA) first
+        subprocess.run(["aplay", str(outwav)], check=False)
+    except FileNotFoundError:
+        try:
+            # Fallback to paplay (PulseAudio)
+            subprocess.run(["paplay", str(outwav)], check=False)
+        except FileNotFoundError:
+            try:
+                # Final fallback to ffplay
+                subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(outwav)], check=False)
+            except FileNotFoundError:
+                print("[TTS] ❌ No audio playback method available")
+    
     MUTE_WAKE_UNTIL = time.time() + MUTE_AFTER_TTS_SEC
 
 def _rms(x: np.ndarray) -> float:
@@ -157,42 +203,33 @@ def record_until_silence(path: str,
                          device_index: Optional[int] = None,
                          sr: int = SR,
                          block: int = BLOCK,
-                         baseline_sec: float = BASELINE_SEC,
-                         start_gate_mul: float = START_GATE_MUL,
-                         start_min_ms: int = START_MIN_MS,
-                         silence_gate_mul: float = SILENCE_GATE_MUL,
-                         end_sil_ms: int = END_SIL_MS,
+                         baseline_sec: float = 0.2,
+                         start_gate_mul: float = 1.1,
+                         start_min_ms: int = 60,
+                         silence_gate_mul: float = 1.05,
+                         end_sil_ms: int = 500,
                          max_record_sec: float = MAX_RECORD_SEC) -> bool:
     """
-    Waits for speech (RMS above start gate for start_min_ms), then records until trailing
-    silence lasts end_sil_ms (or max_record_sec). Saves 16k/mono PCM16 wav to `path`.
-    Returns True if something was recorded; False if we timed out waiting for speech.
+    Simplified recording function - relies on openWakeWord's built-in Speex noise suppression
+    Records until trailing silence, optimized for Ubuntu with minimal custom processing.
     """
-    kwargs = {"channels":1, "samplerate":sr, "blocksize":block, "dtype":"float32"}
+    kwargs = {"channels": 1, "samplerate": sr, "blocksize": block, "dtype": "float32"}
     if device_index is not None:
         kwargs["device"] = device_index
 
-    print("[rec] calibrating noise…")
+    print("[rec] Starting recording with openWakeWord noise suppression...")
     with sd.InputStream(**kwargs) as stream:
-        # Baseline
+        # Quick baseline for basic energy detection
         acc = []
         t0 = time.time()
         while time.time() - t0 < baseline_sec:
             audio, _ = stream.read(block)
             acc.append(_rms(np.squeeze(audio)))
-        baseline = float(np.median(acc)) if acc else 0.0
-        start_gate = max(baseline * start_gate_mul, 0.012)
-        sil_gate   = max(baseline * silence_gate_mul, 0.010)
+        baseline = float(np.median(acc)) if acc else 0.01
+        start_gate = max(baseline * start_gate_mul, 0.008)
+        sil_gate = max(baseline * silence_gate_mul, 0.006)
 
-        # adaptive soften if room is unusually loud/quiet
-        if baseline > 0.05:          # noisy room
-            start_gate *= 0.8
-            sil_gate   *= 0.85
-        elif baseline < 0.008:       # very quiet room
-            start_gate *= 0.9
-            sil_gate   *= 0.9
-
-        print(f"[rec] baseline={baseline:.4f} start_gate={start_gate:.4f} sil_gate={sil_gate:.4f}")
+        print(f"[rec] Energy gates: start={start_gate:.4f}, silence={sil_gate:.4f}")
 
         # Wait for speech
         above_ms = 0.0
@@ -208,14 +245,15 @@ def record_until_silence(path: str,
                 above_ms = 0.0
             time.sleep(0.002)
         else:
-            print("[rec] no speech detected in window.")
+            print("[rec] No speech detected.")
             return False
 
         # Record until trailing silence
-        print("[rec] recording…")
-        frames: List[np.ndarray] = []
+        print("[rec] Recording...")
+        frames = []
         trailing_sil_ms = 0.0
         rec_start = time.time()
+        
         while time.time() - rec_start < max_record_sec:
             audio, _ = stream.read(block)
             a = np.squeeze(audio).astype(np.float32, copy=False)
@@ -224,7 +262,7 @@ def record_until_silence(path: str,
             if e < sil_gate:
                 trailing_sil_ms += (1000.0 * block / sr)
                 if trailing_sil_ms >= end_sil_ms:
-                    print("[rec] stop on silence.")
+                    print("[rec] Stopping on silence.")
                     break
             else:
                 trailing_sil_ms = 0.0
@@ -233,11 +271,14 @@ def record_until_silence(path: str,
     if not frames:
         return False
 
+    # Combine and save audio
     y = np.concatenate(frames, axis=0)
     y = _normalize_audio(y, target_dbfs=-20.0)
     sf.write(path, y, sr, subtype="PCM_16")
+    
     try:
-        print("Recorded size:", os.path.getsize(path), "bytes")
+        size = os.path.getsize(path)
+        print(f"[rec] Recorded: {size} bytes ({len(y)/sr:.1f}s)")
     except Exception:
         pass
     return True
@@ -319,7 +360,7 @@ def ask_llama_raw(prompt: str, n_predict: int = 200, temperature: float = 0.7) -
     Make sure `ollama serve` is running on localhost:11434.
     """
     payload = {
-        "model": "llama3.2:3b",   # or "qwen2.5:7b" / "gemma2:9b"
+        "model": LLAMA_MODEL,      # Use configured model
         "prompt": prompt,
         "stream": False,
         "options": {
@@ -331,7 +372,7 @@ def ask_llama_raw(prompt: str, n_predict: int = 200, temperature: float = 0.7) -
     }
     try:
         cp = subprocess.run(
-            ["curl", "-s", "http://127.0.0.1:11434/api/generate", "-d", json.dumps(payload)],
+            ["curl", "-s", LLAMA_URL, "-d", json.dumps(payload)],
             capture_output=True, text=True
         )
         if cp.returncode != 0 or not cp.stdout.strip():
@@ -419,14 +460,15 @@ def is_sleep_phrase(text: str) -> bool:
     t = norm_text(text)
     return any(phrase in t for phrase in SLEEP_PHRASES)
 
-# ---- wake-word (silent ONNX scorer) ----
+# ---- wake-word (Ubuntu-optimized with openWakeWord) ----
 USE_WAKE = True
 oww_model = None
 try:
-    from .wake_silent import DirectWakeONNX, wait_for_wake
-    oww_model = DirectWakeONNX(WAKEWORD_ONNX)  # expects [1,N,96] (flexible)
-    print(f"[wakeword] ✅ Silent wake word detector loaded!")
-    print(f"[wakeword] 💡 Will run silently until 'Hey Octobuddy' is detected")
+    from wake_silent import DirectWakeONNX, wait_for_wake
+    oww_model = DirectWakeONNX(WAKEWORD_ONNX, enable_speex=ENABLE_SPEEX)
+    print(f"[wakeword] ✅ Ubuntu-optimized wake word detector loaded!")
+    print(f"[wakeword] 🎯 Using openWakeWord with Speex noise suppression: {ENABLE_SPEEX}")
+    print(f"[wakeword] 💡 Will run silently until wake word is detected")
 except Exception as e:
     print(f"[wakeword] ❌ Disabled (reason: {e}) → using push-to-talk mode")
     print(f"[wakeword] 💡 Press ENTER when you want to speak")
@@ -450,7 +492,7 @@ def main():
                 try:
                     name, score = wait_for_wake(
                         oww_model,
-                        threshold=0.005,                # Optimized threshold - run optimizer to adjust
+                        threshold=WAKE_THRESHOLD,       # Configurable threshold from config
                         input_device_index=INPUT_DEVICE_INDEX,
                         timeout_sec=300,                # 5 minute timeout
                         print_startup=listening_for_wake,  # Only print on first startup
