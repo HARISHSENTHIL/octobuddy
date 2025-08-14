@@ -17,64 +17,52 @@ import sounddevice as sd
 import soundfile as sf
 
 # ---------- CONFIGURATION ----------
-import yaml
-from pathlib import Path
+from dotenv import load_dotenv
 
-# Load configuration
-config_path = Path("docs/config.yaml")
-if config_path.exists():
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    WAKEWORD_ONNX = config['wakeword']['model_path']
-    ENABLE_SPEEX = config['wakeword'].get('enable_speex_noise_suppression', True)
-    WAKE_THRESHOLD = config['wakeword'].get('threshold', 0.005)
-    
-    WHISPER_BIN = config['whisper']['bin']
-    WHISPER_MODEL = config['whisper']['model']
-    
-    PIPER_MODEL = config['piper']['model']
-    PIPER_CFG = config['piper']['config']
-    
-    LLAMA_URL = config['cloud']['llama_url']
-    LLAMA_MODEL = config['cloud'].get('model', 'llama3.2:3b')
-else:
-    # Fallback configuration
-    WAKEWORD_ONNX = "models/Hey_octobuddy.onnx"
-    ENABLE_SPEEX = True
-    WAKE_THRESHOLD = 0.005
-    
-    WHISPER_BIN = "/home/hp/Desktop/whisper.cpp/build/bin/whisper-cli"
-    WHISPER_MODEL = "/home/hp/Desktop/whisper.cpp/models/ggml-base.en.bin"
-    
-    PIPER_MODEL = "./models/en_US-lessac-medium.onnx"
-    PIPER_CFG = "./models/en_US-lessac-medium.onnx.json"
-    
-    LLAMA_URL = "http://127.0.0.1:11434/api/generate"
-    LLAMA_MODEL = "llama3.2:3b"
+# Load environment configuration
+load_dotenv('config.env')
 
-# Set input device index from config
-try:
-    INPUT_DEVICE_INDEX = config.get('audio', {}).get('input_device_index', 5)  # Default to device 5 (16kHz support)
-except:
-    INPUT_DEVICE_INDEX = 5  # Fallback to device 5 (16kHz support)
+# Wake word settings
+ENTRY_WAKEWORD_ONNX = os.getenv('WAKEWORD_ENTRY_MODEL', './models/Hey_octobuddy.onnx')
+EXIT_WAKEWORD_ONNX = os.getenv('WAKEWORD_EXIT_MODEL', './models/bye_octa.onnx')
+ENABLE_SPEEX = os.getenv('WAKEWORD_ENABLE_SPEEX', 'true').lower() == 'true'
+ENTRY_WAKE_THRESHOLD = float(os.getenv('WAKEWORD_ENTRY_THRESHOLD', '0.020'))
+EXIT_WAKE_THRESHOLD = float(os.getenv('WAKEWORD_EXIT_THRESHOLD', '0.025'))
+
+# Whisper STT settings
+WHISPER_BIN = os.getenv('WHISPER_BIN', '/home/hp/Desktop/whisper.cpp/build/bin/whisper-cli')
+WHISPER_MODEL = os.getenv('WHISPER_MODEL', '/home/hp/Desktop/whisper.cpp/models/for-tests-ggml-base.en.bin')
+
+# Piper TTS settings
+PIPER_MODEL = os.getenv('PIPER_MODEL', './models/en_US-lessac-medium.onnx')
+PIPER_CFG = os.getenv('PIPER_CONFIG', './models/en_US-lessac-medium.onnx.json')
+
+# LLM settings
+LLAMA_URL = os.getenv('LLM_URL', 'http://127.0.0.1:11434/api/generate')
+LLAMA_MODEL = os.getenv('LLM_MODEL', 'llama3.2:3b')
+
+# Audio settings
+INPUT_DEVICE_INDEX = int(os.getenv('AUDIO_INPUT_DEVICE_INDEX', '5'))
+SR = int(os.getenv('AUDIO_SAMPLE_RATE', '16000'))
+BLOCK = int(os.getenv('AUDIO_BLOCKSIZE', '512'))
+
+# Audio constants
+MAX_RECORD_SEC = 30.0
+COMMAND_TIMEOUT_SEC = 60.0
+MAX_FOLLOW_UP_TURNS = 3
 
 # ---- Behavior toggles ----
 INACTIVITY_TIMEOUT_SEC = 60
 POST_WAKE_DELAY_SEC    = 0.35
 MUTE_AFTER_TTS_SEC     = 2.0
-COMMAND_TIMEOUT_SEC    = 10.0     # Time to wait for command after wake word
-MAX_FOLLOW_UP_TURNS    = 3        # Max follow-up questions before returning to wake
 
-# Audio settings (Ubuntu-optimized)
-SR                = 16000         # Whisper-friendly
-BLOCK             = 512           # ~32 ms at 16k
-MAX_RECORD_SEC    = 12.0          # hard cap per turn
 
-CACHE_PATH = Path("cache.json")
-BLOCKED_TERMS = {"kill","violence","gun","suicide","sex","nsfw","die","hurt","blood","weapon","drugs","nude","porn","bomb"}
-STOP_PHRASES  = {"bye rona", "stop rona", "by rona"}
-SLEEP_PHRASES = {"sleep rona"}
+# Cache and safety settings
+CACHE_PATH = Path(os.getenv('CACHE_FILE', 'cache.json'))
+BLOCKED_TERMS_LIST = os.getenv('SAFETY_BLOCKED_TERMS', 'kill,violence,gun,suicide,sex').split(',')
+BLOCKED_TERMS = set(term.strip() for term in BLOCKED_TERMS_LIST)
+STOP_PHRASES  = {"bye octobuddy", "stop octobuddy", "goodbye octobuddy"}
+SLEEP_PHRASES = {"sleep octobuddy", "go to sleep octobuddy"}
 
 # Accept both [] and () tags like [background noise], (children talking), etc.
 NON_SPEECH_REGEX = re.compile(
@@ -105,7 +93,7 @@ def list_input_devices():
                 print(f"  #{i:2d}  {d['name']}  (in={d['max_input_channels']}, sr={int(sr)}) ✅ 16kHz - RECOMMENDED")
             else:
                 print(f"  #{i:2d}  {d['name']}  (in={d['max_input_channels']}, sr={int(sr)})")
-    print(f"[devices] Using device #{INPUT_DEVICE_INDEX} (configured in config.yaml)")
+    print(f"[devices] Using device #{INPUT_DEVICE_INDEX} (configured in config.env)")
     print("[devices] Default (in,out):", sd.default.device)
 
 # ----------------- Memory -----------------
@@ -208,10 +196,17 @@ def record_until_silence(path: str,
                          start_min_ms: int = 60,
                          silence_gate_mul: float = 1.05,
                          end_sil_ms: int = 500,
-                         max_record_sec: float = MAX_RECORD_SEC) -> bool:
+                         max_record_sec: float = MAX_RECORD_SEC,
+                         dual_model: Optional[DualWakeDetector] = None) -> Tuple[bool, bool]:
     """
     Simplified recording function - relies on openWakeWord's built-in Speex noise suppression
     Records until trailing silence, optimized for Ubuntu with minimal custom processing.
+    
+    Args:
+        dual_model: Optional dual wake detector to check for exit wake words during recording
+    
+    Returns:
+        Tuple[bool, bool]: (recording_success, exit_wake_detected)
     """
     kwargs = {"channels": 1, "samplerate": sr, "blocksize": block, "dtype": "float32"}
     if device_index is not None:
@@ -246,19 +241,34 @@ def record_until_silence(path: str,
             time.sleep(0.002)
         else:
             print("[rec] No speech detected.")
-            return False
+            return False, False
 
         # Record until trailing silence
         print("[rec] Recording...")
         frames = []
         trailing_sil_ms = 0.0
         rec_start = time.time()
+        exit_detected = False
         
         while time.time() - rec_start < max_record_sec:
             audio, _ = stream.read(block)
             a = np.squeeze(audio).astype(np.float32, copy=False)
             frames.append(a)
             e = _rms(a)
+            
+            # Check for exit wake word during recording (if dual model provided)
+            if dual_model and len(frames) >= (sr // block):  # Check every ~1 second of audio
+                # Get the last second of audio for wake word detection
+                recent_frames = frames[-(sr // block):]
+                recent_audio = np.concatenate(recent_frames, axis=0)
+                # Convert to int16 for wake word detection
+                recent_audio_int16 = (recent_audio * 32767).astype(np.int16)
+                
+                if check_for_exit_wake_word(dual_model, recent_audio_int16):
+                    exit_detected = True
+                    print("\n[rec] 🚪 Exit wake word detected during recording - stopping")
+                    break
+            
             if e < sil_gate:
                 trailing_sil_ms += (1000.0 * block / sr)
                 if trailing_sil_ms >= end_sil_ms:
@@ -269,7 +279,7 @@ def record_until_silence(path: str,
             time.sleep(0.002)
 
     if not frames:
-        return False
+        return False, exit_detected
 
     # Combine and save audio
     y = np.concatenate(frames, axis=0)
@@ -281,7 +291,7 @@ def record_until_silence(path: str,
         print(f"[rec] Recorded: {size} bytes ({len(y)/sr:.1f}s)")
     except Exception:
         pass
-    return True
+    return True, exit_detected
 
 def _read_whisper_txt(wav_path: str) -> str:
     txt_path = Path(wav_path + ".txt")
@@ -464,15 +474,42 @@ def is_sleep_phrase(text: str) -> bool:
 USE_WAKE = True
 oww_model = None
 try:
-    from wake_silent import DirectWakeONNX, wait_for_wake
-    oww_model = DirectWakeONNX(WAKEWORD_ONNX, enable_speex=ENABLE_SPEEX)
-    print(f"[wakeword] ✅ Ubuntu-optimized wake word detector loaded!")
+    from wake_word import DualWakeDetector, wait_for_dual_wake
+    oww_model = DualWakeDetector(ENTRY_WAKEWORD_ONNX, EXIT_WAKEWORD_ONNX, enable_speex=ENABLE_SPEEX)
+    print(f"[wakeword] ✅ Dual wake word detector loaded!")
     print(f"[wakeword] 🎯 Using openWakeWord with Speex noise suppression: {ENABLE_SPEEX}")
     print(f"[wakeword] 💡 Will run silently until wake word is detected")
 except Exception as e:
     print(f"[wakeword] ❌ Disabled (reason: {e}) → using push-to-talk mode")
     print(f"[wakeword] 💡 Press ENTER when you want to speak")
     USE_WAKE = False
+
+def check_for_exit_wake_word(dual_model: DualWakeDetector, audio_chunk: np.ndarray) -> bool:
+    """
+    Check audio chunk for exit wake word without creating a separate audio stream
+    Returns True if exit wake word is detected
+    """
+    try:
+        # Get predictions for the audio chunk
+        predictions = dual_model.predict(audio_chunk)
+        exit_score = predictions.get('exit', 0.0)
+        
+        # Check if exit threshold is met
+        if exit_score >= EXIT_WAKE_THRESHOLD:
+            exit_name = Path(dual_model.exit_model_path).stem
+            print(f"\n[wakeword] 🚪 EXIT WAKE WORD DETECTED! '{exit_name}' (score={exit_score:.3f})")
+            return True
+        
+        # Optional: Show progress for debugging (can be removed for silent operation)
+        if exit_score > EXIT_WAKE_THRESHOLD * 0.3:
+            from octobuddy_core.wake_word import create_progress_bar
+            bar = create_progress_bar(exit_score, EXIT_WAKE_THRESHOLD)
+            print(f"\r[exit] {bar} {exit_score:.3f}", end="", flush=True)
+        
+        return False
+    except Exception as e:
+        print(f"[wakeword] ❌ Exit wake word check error: {e}")
+        return False
 
 def main():
     list_input_devices()  # check list; set INPUT_DEVICE_INDEX accordingly
@@ -490,24 +527,32 @@ def main():
                 while time.time() < MUTE_WAKE_UNTIL:
                     time.sleep(0.05)
                 try:
-                    name, score = wait_for_wake(
+                    wake_type, score, name = wait_for_dual_wake(
                         oww_model,
-                        threshold=WAKE_THRESHOLD,       # Configurable threshold from config
+                        entry_threshold=ENTRY_WAKE_THRESHOLD,
+                        exit_threshold=EXIT_WAKE_THRESHOLD,
                         input_device_index=INPUT_DEVICE_INDEX,
                         timeout_sec=300,                # 5 minute timeout
                         print_startup=listening_for_wake,  # Only print on first startup
+                        conversation_mode=False  # Looking for entry wake word
                     )
-                    print(f"[wakeword] ✨ WAKE WORD DETECTED! '{name}' (score={score:.2f})")
-                    print(f"[wakeword] 🎤 Ready! Please ask your question now...")
-                    
-                    # Clear countdown to indicate when to start speaking
-                    for i in range(3, 0, -1):
-                        print(f"[wakeword] 🕐 Starting in {i}...", end='\r')
-                        time.sleep(1)
-                    print(f"[wakeword] 🎤 SPEAK NOW! I'm listening...         ")
-                    
-                    listening_for_wake = False
-                    last_activity = time.time()
+                    if wake_type == 'entry':
+                        print(f"[wakeword] ✨ WAKE WORD DETECTED! '{name}' (score={score:.2f})")
+                        print(f"[wakeword] 🎤 Ready! Please ask your question now...")
+                        
+                        # Clear countdown to indicate when to start speaking
+                        for i in range(3, 0, -1):
+                            print(f"[wakeword] 🕐 Starting in {i}...", end='\r')
+                            time.sleep(1)
+                        print(f"[wakeword] 🎤 SPEAK NOW! I'm listening...         ")
+                        
+                        listening_for_wake = False
+                        last_activity = time.time()
+                        print("[wakeword] 💡 Say 'Bye Octobuddy' anytime to end the conversation")
+                    else:
+                        # Unexpected exit wake word while in wake mode
+                        print(f"[wakeword] ⚠️ Exit wake word detected while sleeping - ignoring")
+                        continue
                 except TimeoutError:
                     continue
             elif listening_for_wake:
@@ -527,7 +572,7 @@ def main():
             print(f"[recording] 💡 Speak clearly and naturally - I'll stop when you're done")
             
             # More sensitive recording parameters after wake word
-            ok = record_until_silence(
+            ok, exit_detected = record_until_silence(
                 wav, device_index=INPUT_DEVICE_INDEX,
                 sr=SR, block=BLOCK, 
                 baseline_sec=0.2,           # Even shorter calibration
@@ -535,8 +580,17 @@ def main():
                 start_min_ms=60,            # Very short minimum speech
                 silence_gate_mul=1.05,      # Very sensitive to silence
                 end_sil_ms=500,             # Quick silence detection  
-                max_record_sec=MAX_RECORD_SEC
+                max_record_sec=MAX_RECORD_SEC,
+                dual_model=oww_model if USE_WAKE else None  # Pass dual model for exit detection
             )
+            
+            # Check if exit wake word was detected during recording
+            if exit_detected:
+                print("[wakeword] 👋 Exit wake word detected during recording - goodbye!")
+                speak_piper("Goodbye! Say 'Hey Octobuddy' if you want to chat again.")
+                listening_for_wake = True
+                continue
+            
             if not ok:
                 # no speech detected within timeout
                 print("[speech] 🔇 I didn't hear anything. Try saying 'Hey Octobuddy' again!")
@@ -612,6 +666,7 @@ def main():
                 time.sleep(1.0)
             else:
                 print(f"[conversation] 🔄 Turn {conversation_turns}/{MAX_FOLLOW_UP_TURNS} - listening for follow-up question...")
+                print(f"[conversation] 💡 Say 'Bye Octobuddy' to end the conversation early")
                 # Continue listening for follow-up questions with a shorter timeout
                 last_activity = time.time()
 

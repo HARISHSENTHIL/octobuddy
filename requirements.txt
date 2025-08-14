@@ -3,9 +3,11 @@ piper-tts
 numpy
 openwakeword
 requests
-PyYAML
+python-dotenv
 soundfile
 piper
 librosa
 speexdsp-ns
 scipy
+openai-whisper
+python-dotenv
